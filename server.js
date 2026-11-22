@@ -10,33 +10,45 @@ const CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const cache = new Map();
 
 async function fetchWeatherLayer(lat, lng) {
-  const url = new URL('https://api.open-meteo.com/v1/forecast');
-  url.searchParams.set('latitude', String(lat));
-  url.searchParams.set('longitude', String(lng));
-  url.searchParams.set('current', 'temperature_2m,relative_humidity_2m,precipitation,cloud_cover');
-  url.searchParams.set('hourly', 'soil_moisture_0_to_1cm,soil_moisture_1_to_3cm');
-  url.searchParams.set('timezone', 'auto');
+  try {
+    const url = new URL('https://api.open-meteo.com/v1/forecast');
+    url.searchParams.set('latitude', String(lat));
+    url.searchParams.set('longitude', String(lng));
+    url.searchParams.set('current', 'temperature_2m,relative_humidity_2m,precipitation,cloud_cover');
+    url.searchParams.set('hourly', 'soil_moisture_0_to_1cm,soil_moisture_1_to_3cm');
+    url.searchParams.set('timezone', 'auto');
 
-  const res = await fetch(url.toString());
-  if (!res.ok) throw new Error(`Open-Meteo HTTP ${res.status}`);
+    const res = await fetch(url.toString());
+    if (!res.ok) throw new Error(`Open-Meteo HTTP ${res.status}`);
 
-  const data = await res.json();
-  const current = data.current || {};
-  const hourly = data.hourly || {};
-  const soilRaw =
-    Array.isArray(hourly.soil_moisture_0_to_1cm) && hourly.soil_moisture_0_to_1cm.length > 0
-      ? hourly.soil_moisture_0_to_1cm[0]
-      : null;
+    const data = await res.json();
+    const current = data.current || {};
+    const hourly = data.hourly || {};
+    const soilRaw =
+      Array.isArray(hourly.soil_moisture_0_to_1cm) && hourly.soil_moisture_0_to_1cm.length > 0
+        ? hourly.soil_moisture_0_to_1cm[0]
+        : null;
 
-  return {
-    weather_updated_at: current.time || new Date().toISOString(),
-    cloud_cover_pct: typeof current.cloud_cover === 'number' ? current.cloud_cover : null,
-    temperature_c: typeof current.temperature_2m === 'number' ? current.temperature_2m : null,
-    humidity_pct: typeof current.relative_humidity_2m === 'number' ? current.relative_humidity_2m : null,
-    precipitation_mm: typeof current.precipitation === 'number' ? current.precipitation : null,
-    soil_moisture_pct: typeof soilRaw === 'number' ? Number((soilRaw * 100).toFixed(1)) : null,
-    source: 'Open-Meteo'
-  };
+    return {
+      weather_updated_at: current.time || new Date().toISOString(),
+      cloud_cover_pct: typeof current.cloud_cover === 'number' ? current.cloud_cover : null,
+      temperature_c: typeof current.temperature_2m === 'number' ? current.temperature_2m : null,
+      humidity_pct: typeof current.relative_humidity_2m === 'number' ? current.relative_humidity_2m : null,
+      precipitation_mm: typeof current.precipitation === 'number' ? current.precipitation : null,
+      soil_moisture_pct: typeof soilRaw === 'number' ? Number((soilRaw * 100).toFixed(1)) : null,
+      source: 'Open-Meteo'
+    };
+  } catch (err) {
+    return {
+      weather_updated_at: null,
+      cloud_cover_pct: null,
+      temperature_c: null,
+      humidity_pct: null,
+      precipitation_mm: null,
+      soil_moisture_pct: null,
+      source: `Open-Meteo gecici limit (${err.message})`
+    };
+  }
 }
 
 async function getCopernicusToken() {
@@ -73,7 +85,8 @@ async function fetchSatelliteStats(token, bbox, fromDate, now) {
     };
   }
 
-  const evalscript = `//VERSION=3
+  try {
+    const evalscript = `//VERSION=3
 function setup() {
   return {
     input: [{ bands: ["B04", "B08", "SCL", "dataMask"] }],
@@ -92,41 +105,49 @@ function evaluatePixel(samples) {
   return { ndvi: [ndvi], dataMask: [1] };
 }`;
 
-  const res = await fetch('https://sh.dataspace.copernicus.eu/api/v1/statistics', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      input: { bounds: { bbox }, data: [{ type: 'sentinel-2-l2a' }] },
-      aggregation: {
-        timeRange: { from: fromDate.toISOString(), to: now.toISOString() },
-        aggregationInterval: { of: 'P14D' },
-        evalscript
-      }
-    })
-  });
+    const res = await fetch('https://sh.dataspace.copernicus.eu/api/v1/statistics', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        input: { bounds: { bbox }, data: [{ type: 'sentinel-2-l2a' }] },
+        aggregation: {
+          timeRange: { from: fromDate.toISOString(), to: now.toISOString() },
+          aggregationInterval: { of: 'P14D' },
+          evalscript
+        }
+      })
+    });
 
-  if (!res.ok) throw new Error(`Sentinel Hub Statistical HTTP ${res.status}`);
-  const stats = await res.json();
-  const entry = Array.isArray(stats.data) ? stats.data[stats.data.length - 1] : null;
-  const ndviMean = entry?.outputs?.ndvi?.bands?.B0?.stats?.mean;
+    if (!res.ok) throw new Error(`Sentinel Hub Statistical HTTP ${res.status}`);
+    const stats = await res.json();
+    const entry = Array.isArray(stats.data) ? stats.data[stats.data.length - 1] : null;
+    const ndviMean = entry?.outputs?.ndvi?.bands?.B0?.stats?.mean;
 
-  if (typeof ndviMean !== 'number' || Number.isNaN(ndviMean)) {
+    if (typeof ndviMean !== 'number' || Number.isNaN(ndviMean)) {
+      return {
+        ndvi_index: null,
+        lai_index: null,
+        satellite_observation_date: entry?.interval?.to || null,
+        status: 'Bulut ortusu nedeniyle gecerli uydu gozlemi alinamadi'
+      };
+    }
+
+    const ndvi = Number(ndviMean.toFixed(3));
+    const lai = Number(Math.max(0, 3.618 * ndvi - 0.118).toFixed(2));
+    return {
+      ndvi_index: ndvi,
+      lai_index: lai,
+      satellite_observation_date: entry?.interval?.to || now.toISOString(),
+      status: 'Sentinel-2 L2A (Copernicus Data Space)'
+    };
+  } catch (err) {
     return {
       ndvi_index: null,
       lai_index: null,
-      satellite_observation_date: entry?.interval?.to || null,
-      status: 'Bulut ortusu nedeniyle gecerli uydu gozlemi alinamadi'
+      satellite_observation_date: null,
+      status: `Uydu istatistik hatasi: ${err.message}`
     };
   }
-
-  const ndvi = Number(ndviMean.toFixed(3));
-  const lai = Number(Math.max(0, 3.618 * ndvi - 0.118).toFixed(2));
-  return {
-    ndvi_index: ndvi,
-    lai_index: lai,
-    satellite_observation_date: entry?.interval?.to || now.toISOString(),
-    status: 'Sentinel-2 L2A (Copernicus Data Space)'
-  };
 }
 
 async function fetchHeatmapPng(token, bbox, fromDate, now, evalscript) {
@@ -168,7 +189,8 @@ async function fetchVisualLayers(token, bbox, fromDate, now) {
     };
   }
 
-  const moistureScript = `//VERSION=3
+  try {
+    const moistureScript = `//VERSION=3
 function setup() { return { input: ["B08", "B11", "SCL", "dataMask"], output: { bands: 4 } }; }
 function evaluatePixel(s) {
   if ([3, 8, 9, 10].includes(s.SCL) || s.dataMask === 0) return [0, 0, 0, 0];
@@ -179,7 +201,7 @@ function evaluatePixel(s) {
   return [0.1, 0.4, 0.9, 0.85];
 }`;
 
-  const laiScript = `//VERSION=3
+    const laiScript = `//VERSION=3
 function setup() { return { input: ["B04", "B08", "SCL", "dataMask"], output: { bands: 4 } }; }
 function evaluatePixel(s) {
   if ([3, 8, 9, 10].includes(s.SCL) || s.dataMask === 0) return [0, 0, 0, 0];
@@ -190,7 +212,7 @@ function evaluatePixel(s) {
   return [0.1, 0.55, 0.2, 0.85];
 }`;
 
-  const mineralScript = `//VERSION=3
+    const mineralScript = `//VERSION=3
 function setup() { return { input: ["B05", "B8A", "SCL", "dataMask"], output: { bands: 4 } }; }
 function evaluatePixel(s) {
   if ([3, 8, 9, 10].includes(s.SCL) || s.dataMask === 0) return [0, 0, 0, 0];
@@ -201,48 +223,58 @@ function evaluatePixel(s) {
   return [0.98, 0.85, 0.25, 0.85];
 }`;
 
-  const [soilMap, laiMap, mineralMap] = await Promise.all([
-    fetchHeatmapPng(token, bbox, fromDate, now, moistureScript),
-    fetchHeatmapPng(token, bbox, fromDate, now, laiScript),
-    fetchHeatmapPng(token, bbox, fromDate, now, mineralScript)
-  ]);
+    const [soilMap, laiMap, mineralMap] = await Promise.all([
+      fetchHeatmapPng(token, bbox, fromDate, now, moistureScript),
+      fetchHeatmapPng(token, bbox, fromDate, now, laiScript),
+      fetchHeatmapPng(token, bbox, fromDate, now, mineralScript)
+    ]);
 
-  return {
-    bbox,
-    soil_moisture_map_base64: soilMap,
-    lai_map_base64: laiMap,
-    mineral_map_base64: mineralMap,
-    status: 'Sentinel-2 L2A Processing API (Gercek uydu goruntu katmanlari)'
-  };
+    return {
+      bbox,
+      soil_moisture_map_base64: soilMap,
+      lai_map_base64: laiMap,
+      mineral_map_base64: mineralMap,
+      status: 'Sentinel-2 L2A Processing API (Gercek uydu goruntu katmanlari)'
+    };
+  } catch (err) {
+    return {
+      bbox,
+      soil_moisture_map_base64: null,
+      lai_map_base64: null,
+      mineral_map_base64: null,
+      status: `Uydu gorsel hatasi: ${err.message}`
+    };
+  }
 }
 
 async function fetchNvidiaInference({ lat, lng, cropType, weather, satellite }) {
   const apiKey = process.env.NVIDIA_API_KEY;
   if (!apiKey) {
+    const ndviPart = satellite.ndvi_index !== null ? `NDVI ${satellite.ndvi_index}, LAI ${satellite.lai_index} olculdu.` : 'Uydu gozlemi alinamadi.';
     return {
       minerals: { nitrogen_n: null, phosphorus_p: null, potassium_k: null },
       crop_height_cm: null,
       estimated_yield_change_pct: null,
       optimal_harvest_window_days: null,
-      harman_summary: 'Veri bekleniyor: NVIDIA API anahtari henuz tanimli degil.',
+      harman_summary: `${ndviPart} NVIDIA API anahtari eklendiginde mineral ve verim cikarimi da aktif olacaktir.`,
       status: 'Veri Bekleniyor (NVIDIA_API_KEY tanimli degil)'
     };
   }
 
-  if (satellite.ndvi_index === null || weather.soil_moisture_pct === null) {
+  if (satellite.ndvi_index === null) {
     return {
       minerals: { nitrogen_n: null, phosphorus_p: null, potassium_k: null },
       crop_height_cm: null,
       estimated_yield_change_pct: null,
       optimal_harvest_window_days: null,
-      harman_summary: 'Veri bekleniyor: Uydu veya hava olcumu eksik oldugu icin cikarim yapilmadi.',
-      status: 'Veri Bekleniyor (Uydu veya hava verisi eksik)'
+      harman_summary: 'Veri bekleniyor: Uydu olcumu eksik oldugu icin cikarim yapilmadi.',
+      status: 'Veri Bekleniyor (Uydu verisi eksik)'
     };
   }
 
   const model = process.env.NVIDIA_MODEL || 'meta/llama-3.1-70b-instruct';
   const prompt = `Tarim Turkiye Harman yapay zekasi olarak koordinat (${lat}, ${lng}) ve urun "${cropType || 'Genel Tarla'}" icin SADECE verilen olcumlere dayanarak JSON uret.
-Olcumler: NDVI=${satellite.ndvi_index}, LAI=${satellite.lai_index}, Toprak Nemi=%${weather.soil_moisture_pct}, Sicaklik=${weather.temperature_c}C, Yagis=${weather.precipitation_mm}mm.
+Olcumler: NDVI=${satellite.ndvi_index}, LAI=${satellite.lai_index}, Toprak Nemi=%${weather.soil_moisture_pct}, Sicaklik=${weather.temperature_c}C.
 Sadece su JSON yapisini dondur:
 {"nitrogen_n": number|null, "phosphorus_p": number|null, "potassium_k": number|null, "crop_height_cm": number|null, "estimated_yield_change_pct": number|null, "optimal_harvest_window_days": number|null, "harman_summary": string}`;
 
@@ -284,11 +316,20 @@ async function computeLandValues({ lat, lng, cropType }) {
   const now = new Date();
   const fromDate = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
 
-  const [weather, token] = await Promise.all([fetchWeatherLayer(lat, lng), getCopernicusToken()]);
-  const [satellite, visualLayers] = await Promise.all([
-    fetchSatelliteStats(token, bbox, fromDate, now),
-    fetchVisualLayers(token, bbox, fromDate, now)
+  let token = null;
+  let tokenErr = null;
+  try {
+    token = await getCopernicusToken();
+  } catch (err) {
+    tokenErr = err.message;
+  }
+
+  const [weather, satellite, visualLayers] = await Promise.all([
+    fetchWeatherLayer(lat, lng),
+    tokenErr ? Promise.resolve({ ndvi_index: null, lai_index: null, satellite_observation_date: null, status: tokenErr }) : fetchSatelliteStats(token, bbox, fromDate, now),
+    tokenErr ? Promise.resolve({ bbox, soil_moisture_map_base64: null, lai_map_base64: null, mineral_map_base64: null, status: tokenErr }) : fetchVisualLayers(token, bbox, fromDate, now)
   ]);
+
   const nvidia = await fetchNvidiaInference({ lat, lng, cropType, weather, satellite });
 
   const payload = {
@@ -320,7 +361,9 @@ async function computeLandValues({ lat, lng, cropType }) {
     }
   };
 
-  cache.set(cacheKey, { ts: Date.now(), payload });
+  if (satellite.ndvi_index !== null) {
+    cache.set(cacheKey, { ts: Date.now(), payload });
+  }
   return payload;
 }
 
